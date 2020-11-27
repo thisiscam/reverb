@@ -32,7 +32,7 @@ function build_wheel() {
   pushd ${TMPDIR} > /dev/null
 
   echo $(date) : "=== Building wheel"
-  "${PYTHON_BIN_PATH}" setup.py bdist_wheel ${PKG_NAME_FLAG} ${RELEASE_FLAG} ${TF_VERSION_FLAG} --plat $PLATFORM > /dev/null
+  "${PYTHON_BIN_PATH}" setup.py bdist_wheel ${PKG_NAME_FLAG} ${RELEASE_FLAG} ${TF_VERSION_FLAG} --plat $PLATFORM | grep so # > /dev/null
   DEST=${TMPDIR}/dist/
   if [[ ! "$TMPDIR" -ef "$DESTDIR" ]]; then
     mkdir -p ${DESTDIR}
@@ -69,8 +69,23 @@ function prepare_src() {
   # TODO(b/155300149): Don't move .so files to the top-level directory.
   # This copies all .so files except for those found in the ops directory, which
   # must remain where they are for TF to find them.
-  find "${TMPDIR}/reverb/cc" -type d -name ops -prune -o -name '*.so' \
+  find "${TMPDIR}/reverb/cc" -type d -name ops -prune -o -name '*.so' -prune -o -name '*.dylib'
+
+  find "${TMPDIR}/reverb/cc" -type d -name ops -prune -o -name '*.so' -prune -o -name '*.dylib' \
     -exec mv {} "${TMPDIR}/reverb" \;
+
+  # Copy darwin libs over so they can be loaded at runtime
+  so_lib_dir=$(ls $RUNFILES | grep solib) || true
+  if [ -n "${so_lib_dir}" ]; then
+    mkdir -p "${TMPDIR}/${so_lib_dir}"
+    proto_so_dir=$(ls ${RUNFILES}/${so_lib_dir} | grep proto) || true
+    for dir in ${proto_so_dir}; do
+      echo "===== DIR = $dir"
+      cp -R ${RUNFILES}/${so_lib_dir}/${dir} "${TMPDIR}/${so_lib_dir}"
+    done
+
+    cp -r $TMPDIR/${so_lib_dir} `dirname $PYTHON_LIB_PATH`
+  fi
 }
 
 function usage() {
