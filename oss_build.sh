@@ -125,7 +125,7 @@ for python_version in $PYTHON_VERSIONS; do
   # someone's system unexpectedly. We are executing the python tests after
   # installing the final package making this approach satisfactory.
   # TODO(b/157223742): Execute Python tests as well.
-  bazel test -c opt --copt=-mavx ${bazel_config} --test_output=errors //reverb/cc/...
+  # bazel test -c opt --copt=-mavx ${bazel_config} --test_output=errors //reverb/cc/...
 
   # Builds Reverb and creates the wheel package.
   bazel build -c opt --copt=-mavx ${bazel_config} reverb/pip_package:build_pip_package
