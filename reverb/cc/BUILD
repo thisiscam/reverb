@@ -205,6 +205,7 @@ reverb_cc_library(
     hdrs = ["sampler.h"],
     deps = [
         ":chunk_store",
+        ":errors",
         ":reverb_service_cc_grpc_proto",
         ":reverb_service_cc_proto",
         ":schema_cc_proto",
@@ -386,4 +387,93 @@ reverb_cc_grpc_library(
     generate_mocks = True,
     visibility = ["//reverb:__subpackages__"],
     deps = [":reverb_service_cc_proto"],
+)
+
+reverb_cc_library(
+    name = "reverb_service_async_impl",
+    srcs = ["reverb_service_async_impl.cc"],
+    hdrs = [
+        "reverb_service_async_impl.h",
+    ],
+    deps = [
+        ":reverb_server_bidi_reactor",
+        ":task_worker",
+        "//reverb/cc:chunk_store",
+        "//reverb/cc:reverb_service_cc_grpc_proto",
+        "//reverb/cc:reverb_service_cc_proto",
+        "//reverb/cc:sampler",
+        "//reverb/cc:schema_cc_proto",
+        "//reverb/cc:table",
+        "//reverb/cc/checkpointing:interface",
+        "//reverb/cc/platform:hash_map",
+        "//reverb/cc/platform:hash_set",
+        "//reverb/cc/platform:logging",
+        "//reverb/cc/platform:status_macros",
+        "//reverb/cc/platform:thread",
+        "//reverb/cc/support:cleanup",
+        "//reverb/cc/support:grpc_util",
+        "//reverb/cc/support:periodic_closure",
+        "//reverb/cc/support:trajectory_util",
+        "//reverb/cc/support:uint128",
+        "//reverb/cc/support:unbounded_queue",
+    ] + reverb_grpc_deps() + reverb_absl_deps(),
+    alwayslink = 1,
+)
+
+reverb_cc_library(
+    name = "task_worker",
+    hdrs = ["task_worker.h"],
+    deps = [
+        ":thread_stats",
+        "//reverb/cc:table",
+        "//reverb/cc/platform:logging",
+        "//reverb/cc/platform:status_macros",
+        "//reverb/cc/platform:thread",
+        "//reverb/cc/support:periodic_closure",
+        "//reverb/cc/support:unbounded_queue",
+    ] + reverb_absl_deps(),
+)
+
+reverb_cc_library(
+    name = "reverb_server_bidi_reactor",
+    hdrs = ["reverb_server_bidi_reactor.h"],
+    deps = [
+        ":task_worker",
+        "//reverb/cc/platform:logging",
+        "//reverb/cc/platform:status_macros",
+        "//reverb/cc/support:grpc_util",
+    ] + reverb_grpc_deps() + reverb_absl_deps(),
+)
+
+reverb_cc_library(
+    name = "thread_stats",
+    srcs = ["thread_stats.cc"],
+    hdrs = ["thread_stats.h"],
+    deps = reverb_absl_deps(),
+)
+
+reverb_cc_test(
+    name = "reverb_service_async_impl_test",
+    srcs = ["reverb_service_async_impl_test.cc"],
+    deps = [
+        ":reverb_service_async_impl",
+        "//reverb/cc:reverb_service_cc_proto",
+        "//reverb/cc:schema_cc_proto",
+        "//reverb/cc/platform:checkpointing",
+        "//reverb/cc/platform:status_macros",
+        "//reverb/cc/platform:status_matchers",
+        "//reverb/cc/platform:thread",
+        "//reverb/cc/selectors:fifo",
+        "//reverb/cc/selectors:interface",
+        "//reverb/cc/selectors:uniform",
+        "//reverb/cc/testing:proto_test_util",
+    ] + reverb_grpc_deps() + reverb_absl_deps() + reverb_tf_deps(),
+)
+
+reverb_cc_test(
+    name = "thread_stats_test",
+    srcs = ["thread_stats_test.cc"],
+    deps = [
+        ":thread_stats",
+    ] + reverb_absl_deps(),
 )

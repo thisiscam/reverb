@@ -29,6 +29,7 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "reverb/cc/chunk_store.h"
+#include "reverb/cc/errors.h"
 #include "reverb/cc/platform/hash_map.h"
 #include "reverb/cc/platform/hash_set.h"
 #include "reverb/cc/platform/logging.h"
@@ -54,8 +55,8 @@ inline bool SampleIsDone(const std::vector<SampleStreamResponse>& sample) {
 
   internal::flat_hash_set<uint64_t> received_chunks;
   for (const auto& response : sample) {
-    if (response.has_data()) {
-      received_chunks.insert(response.data().chunk_key());
+    for (const auto& chunk : response.data()) {
+      received_chunks.insert(chunk.chunk_key());
     }
   }
 
@@ -92,8 +93,10 @@ absl::Status AsSample(std::vector<SampleStreamResponse> responses,
   const auto& info = responses.front().info();
   internal::flat_hash_map<uint64_t, std::unique_ptr<ChunkData>> chunks;
   for (auto& response : responses) {
-    auto key = response.data().chunk_key();
-    chunks[key] = absl::WrapUnique<ChunkData>(response.release_data());
+    while (response.data_size() != 0) {
+      auto* chunk = response.mutable_data()->ReleaseLast();
+      chunks[chunk->chunk_key()] = absl::WrapUnique<ChunkData>(chunk);
+    }
   }
 
   // Count the number of times each chunk is referenced in the column slices.
@@ -147,15 +150,17 @@ absl::Status AsSample(std::vector<SampleStreamResponse> responses,
 absl::Status AsSample(const Table::SampledItem& sampled_item,
                       std::unique_ptr<Sample>* sample) {
   internal::flat_hash_map<uint64_t, std::shared_ptr<ChunkStore::Chunk>> chunks(
-      sampled_item.chunks.size());
-  for (auto& chunk : sampled_item.chunks) {
+      sampled_item.ref->chunks.size());
+  for (auto& chunk : sampled_item.ref->chunks) {
     chunks[chunk->key()] = chunk;
   }
 
   std::vector<std::vector<tensorflow::Tensor>> column_chunks;
-  column_chunks.reserve(sampled_item.item.flat_trajectory().columns_size());
+  column_chunks.reserve(
+      sampled_item.ref->item.flat_trajectory().columns_size());
 
-  for (const auto& column : sampled_item.item.flat_trajectory().columns()) {
+  for (const auto& column :
+       sampled_item.ref->item.flat_trajectory().columns()) {
     std::vector<tensorflow::Tensor> unpacked_chunks;
 
     for (const auto& slice : column.chunk_slices()) {
@@ -168,13 +173,12 @@ absl::Status AsSample(const Table::SampledItem& sampled_item,
   }
 
   std::vector<bool> squeeze_columns;
-  for (const auto& col : sampled_item.item.flat_trajectory().columns()) {
+  for (const auto& col : sampled_item.ref->item.flat_trajectory().columns()) {
     squeeze_columns.push_back(col.squeeze());
   }
-
   *sample = absl::make_unique<deepmind::reverb::Sample>(
-      sampled_item.item.key(), sampled_item.probability,
-      sampled_item.table_size, sampled_item.item.priority(),
+      sampled_item.ref->item.key(), sampled_item.probability,
+      sampled_item.table_size, sampled_item.priority,
       std::move(column_chunks), std::move(squeeze_columns));
 
   return absl::OkStatus();
@@ -225,6 +229,7 @@ class GrpcSamplerWorker : public SamplerWorker {
 
     int64_t num_samples_returned = 0;
     while (num_samples_returned < num_samples) {
+      // TODO(b/190237214): Ignore timeouts when data is not being requested.
       SampleStreamRequest request;
       request.set_table(table_name_);
       request.set_num_samples(
@@ -242,7 +247,16 @@ class GrpcSamplerWorker : public SamplerWorker {
         while (!SampleIsDone(responses)) {
           SampleStreamResponse response;
           if (!stream->Read(&response)) {
-            return {num_samples_returned, FromGrpcStatus(stream->Finish())};
+            auto status = FromGrpcStatus(stream->Finish());
+            if (errors::IsRateLimiterTimeout(status) &&
+                queue->num_waiting_to_pop() < 1) {
+              // The rate limiter timed out but no one is waiting for new data,
+              // so we can exit with an OkStatus and get restarted with a new
+              // stream.
+              return {num_samples_returned, absl::OkStatus()};
+            } else {
+              return {num_samples_returned, status};
+            }
           }
           responses.push_back(std::move(response));
         }
@@ -338,14 +352,24 @@ class LocalSamplerWorker : public SamplerWorker {
 
       // If the deadline is exceeded but the "real deadline" is still in the
       // future then we are only waking up to check for cancellation.
-      if (absl::IsDeadlineExceeded(status) && absl::Now() < final_deadline) {
-        continue;
+      if (absl::IsDeadlineExceeded(status)) {
+        if (absl::Now() < final_deadline) {
+          continue;
+        }
+        if (queue->num_waiting_to_pop() < 1) {
+          // While no items requested, we reset the final_deadline and restart.
+          final_deadline = absl::Now() + rate_limiter_timeout;
+          continue;
+        }
       }
 
       // All other errors are "real" and thus should be returned to the caller.
       if (!status.ok()) {
         return {num_samples_returned, status};
       }
+
+      // We received new items, so reset the timeout deadline.
+      final_deadline = absl::Now() + rate_limiter_timeout;
 
       // Push sampled items to queue.
       for (const auto& item : items) {
@@ -481,8 +505,8 @@ Sampler::Sampler(std::shared_ptr<Table> table, const Options& options,
 
 Sampler::~Sampler() { Close(); }
 
-absl::Status Sampler::GetNextTimestep(
-    std::vector<tensorflow::Tensor>* data, bool* end_of_sequence) {
+absl::Status Sampler::GetNextTimestep(std::vector<tensorflow::Tensor>* data,
+                                      bool* end_of_sequence) {
   REVERB_RETURN_IF_ERROR(MaybeSampleNext());
   if (!active_sample_->is_composed_of_timesteps()) {
     return absl::InvalidArgumentError(
@@ -505,8 +529,7 @@ absl::Status Sampler::GetNextTimestep(
   return absl::OkStatus();
 }
 
-absl::Status Sampler::GetNextSample(
-    std::vector<tensorflow::Tensor>* data) {
+absl::Status Sampler::GetNextSample(std::vector<tensorflow::Tensor>* data) {
   std::unique_ptr<Sample> sample;
   REVERB_RETURN_IF_ERROR(PopNextSample(&sample));
   REVERB_RETURN_IF_ERROR(sample->AsBatchedTimesteps(data));
@@ -637,6 +660,7 @@ void Sampler::RunWorker(SamplerWorker* worker) {
       mu_.Unlock();
       return;
     }
+
     int64_t samples_to_stream =
         std::min<int64_t>(max_samples_per_stream_, max_samples_ - requested_);
     requested_ += samples_to_stream;

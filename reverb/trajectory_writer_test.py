@@ -21,6 +21,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import numpy as np
 from reverb import client as client_lib
+from reverb import errors
 from reverb import pybind
 from reverb import server as server_lib
 from reverb import trajectory_writer
@@ -40,9 +41,20 @@ class FakeWeakCellRef:
   def dtype(self):
     return np.asarray(self.data).dtype
 
+  @property
+  def expired(self):
+    return False
+
+  def numpy(self):
+    return self.data
+
 
 def extract_data(column: trajectory_writer._ColumnHistory):
   return [ref.data if ref else None for ref in column]
+
+
+def _mock_append(x):
+  return [FakeWeakCellRef(y) if y is not None else None for y in x]
 
 
 class TrajectoryWriterTest(parameterized.TestCase):
@@ -51,10 +63,8 @@ class TrajectoryWriterTest(parameterized.TestCase):
     super().setUp()
 
     self.cpp_writer_mock = mock.Mock()
-    self.cpp_writer_mock.Append.side_effect = \
-        lambda x: [FakeWeakCellRef(y) if y is not None else None for y in x]
-    self.cpp_writer_mock.AppendPartial.side_effect = \
-        lambda x: [FakeWeakCellRef(y) if y is not None else None for y in x]
+    self.cpp_writer_mock.Append.side_effect = _mock_append
+    self.cpp_writer_mock.AppendPartial.side_effect = _mock_append
 
     self.writer = trajectory_writer.TrajectoryWriter(self.cpp_writer_mock)
 
@@ -118,17 +128,6 @@ class TrajectoryWriterTest(parameterized.TestCase):
     self.writer.append(first_step_data)
     self.writer.append(second_step_data)
 
-  def test_append_returns_same_structure_as_data(self):
-    first_step_data = {'x': 1, 'y': 2}
-    first_step_ref = self.writer.append(first_step_data)
-    tree.assert_same_structure(first_step_data, first_step_ref)
-
-    # Check that this holds true even if the data structure changes between
-    # steps.
-    second_step_data = {'y': 2, 'z': 3}
-    second_step_ref = self.writer.append(second_step_data)
-    tree.assert_same_structure(second_step_data, second_step_ref)
-
   def test_append_forwards_flat_data_to_cpp_writer(self):
     data = {'x': 1, 'y': 2}
     self.writer.append(data)
@@ -185,8 +184,8 @@ class TrajectoryWriterTest(parameterized.TestCase):
       self.writer.append({'x': 4})
 
   def test_create_item_checks_type_of_leaves(self):
-    first = self.writer.append({'x': 3, 'y': 2})
-    second = self.writer.append({'x': 3, 'y': 2})
+    self.writer.append({'x': 3, 'y': 2})
+    self.writer.append({'x': 3, 'y': 2})
 
     # History automatically transforms data and thus should be valid.
     self.writer.create_item('table', 1.0, {
@@ -194,17 +193,11 @@ class TrajectoryWriterTest(parameterized.TestCase):
         'y': self.writer.history['y'][:],  # Two steps.
     })
 
-    # Columns can be constructed explicitly.
-    self.writer.create_item('table', 1.0, {
-        'x': trajectory_writer.TrajectoryColumn([first['x']]),
-        'y': trajectory_writer.TrajectoryColumn([first['y'], second['y']])
-    })
-
     # But all leaves must be TrajectoryColumn.
     with self.assertRaises(TypeError):
       self.writer.create_item('table', 1.0, {
-          'x': trajectory_writer.TrajectoryColumn([first['x']]),
-          'y': first['y'],
+          'x': self.writer.history['x'][0],
+          'y': self.writer.history['y'][:].numpy(),
       })
 
   def test_flush_checks_block_until_num_itmes(self):
@@ -302,6 +295,30 @@ class TrajectoryWriterTest(parameterized.TestCase):
       # Ending the episode should reset the step count to zero.
       self.writer.end_episode()
 
+  def test_exit_does_not_flush_on_reverb_error(self):
+    # If there are no errors then flush should be called.
+    with mock.patch.object(self.writer, 'flush') as flush_mock:
+      with self.writer:
+        pass
+
+      flush_mock.assert_called_once()
+
+    # It flush if unrelated errors are encountered
+    with mock.patch.object(self.writer, 'flush') as flush_mock:
+      with self.assertRaises(ValueError):
+        with self.writer:
+          raise ValueError('Test')
+
+      flush_mock.assert_called_once()
+
+    # But it should not flush if Reverb raises the error.
+    with mock.patch.object(self.writer, 'flush') as flush_mock:
+      with self.assertRaises(errors.ReverbError):
+        with self.writer:
+          raise errors.DeadlineExceededError('Test')
+
+      flush_mock.assert_not_called()
+
 
 class TrajectoryColumnTest(parameterized.TestCase):
 
@@ -378,6 +395,13 @@ class TrajectoryColumnTest(parameterized.TestCase):
     for i in range(1, 10):
       column = trajectory_writer.TrajectoryColumn([FakeWeakCellRef(data)] * i)
       self.assertEqual(column.shape, (i, *expected_shape))
+
+  def test_shape_squeezed(self):
+    expected_shape = (2, 5)
+    data = np.arange(10).reshape(*expected_shape)
+    column = trajectory_writer.TrajectoryColumn([FakeWeakCellRef(data)],
+                                                squeeze=True)
+    self.assertEqual(column.shape, expected_shape)
 
   @parameterized.named_parameters(
       ('int', 0),

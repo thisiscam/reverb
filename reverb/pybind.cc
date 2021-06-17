@@ -610,7 +610,7 @@ PYBIND11_MODULE(libpybind, m) {
              MaybeRaiseFromStatus(status);
              return std::make_pair(std::move(sample), end_of_sequence);
            })
-      .def("GetNextSample",
+      .def("GetNextTrajectory",
            [](Sampler *sampler) {
              absl::Status status;
              std::vector<tensorflow::Tensor> sample;
@@ -621,7 +621,7 @@ PYBIND11_MODULE(libpybind, m) {
              // details from the status.
              {
                py::gil_scoped_release g;
-               status = sampler->GetNextSample(&sample);
+               status = sampler->GetNextTrajectory(&sample);
              }
 
              MaybeRaiseFromStatus(status);
@@ -647,17 +647,13 @@ PYBIND11_MODULE(libpybind, m) {
       .def(
           "NewSampler",
           [](Client *client, const std::string &table, int64_t max_samples,
-             size_t buffer_size, int64_t validation_timeout_ms) {
+             size_t buffer_size) {
             std::unique_ptr<Sampler> sampler;
             Sampler::Options options;
             options.max_samples = max_samples;
             options.max_in_flight_samples_per_worker = buffer_size;
-            absl::Duration validation_timeout =
-                (validation_timeout_ms < 0)
-                    ? absl::InfiniteDuration()
-                    : absl::Milliseconds(validation_timeout_ms);
-            MaybeRaiseFromStatus(client->NewSampler(
-                table, options, validation_timeout, &sampler));
+            MaybeRaiseFromStatus(client->NewSamplerWithoutSignatureCheck(
+                table, options, &sampler));
             return sampler;
           },
           py::call_guard<py::gil_scoped_release>())

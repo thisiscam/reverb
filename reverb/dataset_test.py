@@ -15,6 +15,7 @@
 
 """Tests for dataset."""
 
+import socket
 import threading
 import time
 
@@ -43,6 +44,13 @@ def make_server():
               max_size=1000000,
               rate_limiter=rate_limiters.MinSize(1)),
           reverb_server.Table(
+              'dist_queue',
+              sampler=item_selectors.Fifo(),
+              remover=item_selectors.Fifo(),
+              max_size=1000000,
+              max_times_sampled=1,
+              rate_limiter=rate_limiters.MinSize(1)),
+          reverb_server.Table(
               'signatured',
               sampler=item_selectors.Prioritized(priority_exponent=1),
               remover=item_selectors.Fifo(),
@@ -69,24 +77,31 @@ def make_server():
   )
 
 
-class ReplayDatasetTest(tf.test.TestCase, parameterized.TestCase):
+class LocalReplayDatasetTest(tf.test.TestCase, parameterized.TestCase):
+  USE_LOCALHOST = True
 
   @classmethod
   def setUpClass(cls):
     super().setUpClass()
     cls._server = make_server()
-    cls._client = client.Client(f'localhost:{cls._server.port}')
+    if cls.USE_LOCALHOST:
+      connect_to = 'localhost'
+    else:
+      connect_to = 'dns:///{}'.format(socket.gethostname())
+    cls._client = client.Client(f'{connect_to}:{cls._server.port}')
 
   def setUp(self):
     super().setUp()
     self._num_prev_samples = {
         table: self._get_total_num_samples(table)
-        for table in ('dist', 'signatured', 'bounded_spec_signatured')
+        for table in ('dist', 'dist_queue', 'signatured',
+                      'bounded_spec_signatured')
     }
 
   def tearDown(self):
     super().tearDown()
     self._client.reset('dist')
+    self._client.reset('dist_queue')
     self._client.reset('signatured')
     self._client.reset('bounded_spec_signatured')
 
@@ -95,20 +110,29 @@ class ReplayDatasetTest(tf.test.TestCase, parameterized.TestCase):
     super().tearDownClass()
     cls._server.stop()
 
-  def _populate_replay(self, sequence_length=100, max_time_steps=None):
+  def _populate_replay(self,
+                       sequence_length=100,
+                       max_time_steps=None,
+                       max_items=1000):
     max_time_steps = max_time_steps or sequence_length
+    num_items = 0
     with self._client.writer(max_time_steps) as writer:
       for i in range(1000):
         writer.append([np.zeros((3, 3), dtype=np.float32)])
-        if i % 5 == 0 and i >= sequence_length:
+        if i % min(5, sequence_length) == 0 and i >= sequence_length:
           writer.create_item(
               table='dist', num_timesteps=sequence_length, priority=1)
+          writer.create_item(
+              table='dist_queue', num_timesteps=sequence_length, priority=1)
           writer.create_item(
               table='signatured', num_timesteps=sequence_length, priority=1)
           writer.create_item(
               table='bounded_spec_signatured',
               num_timesteps=sequence_length,
               priority=1)
+          num_items += 1
+          if num_items >= max_items:
+            break
 
   def _sample_from(self, dataset, num_samples):
     iterator = dataset.make_initializable_iterator()
@@ -294,18 +318,17 @@ class ReplayDatasetTest(tf.test.TestCase, parameterized.TestCase):
           max_in_flight_samples_per_worker=100)
 
   def test_timeout(self):
-
     dataset_0s = reverb_dataset.ReplayDataset(
         self._client.server_address,
-        table='dist',
+        table='dist_queue',
         dtypes=(tf.float32,),
         shapes=(tf.TensorShape([3, 3]),),
-        rate_limiter_timeout_ms=0,
+        rate_limiter_timeout_ms=50,  # Slightly above exactly 0.
         max_in_flight_samples_per_worker=100)
 
     dataset_1s = reverb_dataset.ReplayDataset(
         self._client.server_address,
-        table='dist',
+        table='dist_queue',
         dtypes=(tf.float32,),
         shapes=(tf.TensorShape([3, 3]),),
         rate_limiter_timeout_ms=1000,
@@ -313,7 +336,7 @@ class ReplayDatasetTest(tf.test.TestCase, parameterized.TestCase):
 
     dataset_2s = reverb_dataset.ReplayDataset(
         self._client.server_address,
-        table='dist',
+        table='dist_queue',
         dtypes=(tf.float32,),
         shapes=(tf.TensorShape([3, 3]),),
         rate_limiter_timeout_ms=2000,
@@ -345,9 +368,18 @@ class ReplayDatasetTest(tf.test.TestCase, parameterized.TestCase):
 
     # If we insert some data, and the rate limiter doesn't force any waiting,
     # then we can ask for a timeout of 0s and still get data back.
-    self._populate_replay()
-    got = self._sample_from(dataset_0s, 2)
-    self.assertLen(got, 2)
+    iterator = dataset_0s.make_initializable_iterator()
+    dataset_0s_item = iterator.get_next()
+    self.evaluate(iterator.initializer)
+
+    for _ in range(3):
+      self._populate_replay(max_items=2)
+      # Pull two items
+      for _ in range(2):
+        self.evaluate(dataset_0s_item)
+      # Wait for the time it would take a broken sampler to time out
+      # on next iteration.
+      time.sleep(0.5)
 
   @parameterized.parameters(['signatured'], ['bounded_spec_signatured'])
   def test_inconsistent_signature_size(self, table_name):
@@ -707,6 +739,9 @@ class ReplayDatasetTest(tf.test.TestCase, parameterized.TestCase):
 
   @parameterized.parameters(1, 3, 7)
   def test_respects_flexible_batch_size(self, flexible_batch_size):
+    if not self.USE_LOCALHOST:
+      self.skipTest('TODO(b/190761815): test broken in Nonlocal case')
+
     for _ in range(10):
       self._client.insert((np.ones([3, 3], dtype=np.int32)), {'dist': 1})
 
@@ -816,6 +851,11 @@ class ReplayDatasetTest(tf.test.TestCase, parameterized.TestCase):
       thread.start()
       with self.assertRaises(tf.errors.CancelledError):
         sess.run(item)
+
+
+class NonlocalReplayDatasetTest(LocalReplayDatasetTest):
+  """Test with non-localhost connection to server."""
+  USE_LOCALHOST = False
 
 
 class FromTableSignatureTest(tf.test.TestCase):
