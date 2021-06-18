@@ -124,7 +124,7 @@ class Table:
       extensions: Optional sequence of extensions used to add extra features to
         the table.
       signature: Optional nested structure containing `tf.TypeSpec` objects,
-        describing the storage schema for this table.
+        describing the schema of items in this table.
 
     Raises:
       ValueError: If name is empty.
@@ -219,6 +219,11 @@ class Table:
   def name(self):
     return self.internal_table.name()
 
+  @property
+  def info(self) -> reverb_types.TableInfo:
+    proto_string = self.internal_table.info()
+    return reverb_types.TableInfo.from_serialized_proto(proto_string)
+
   def can_sample(self, num_samples: int) -> bool:
     """Returns True if a sample operation is permitted at the current state."""
     return self.internal_table.can_sample(num_samples)
@@ -226,6 +231,9 @@ class Table:
   def can_insert(self, num_inserts: int) -> bool:
     """Returns True if an insert operation is permitted at the current state."""
     return self.internal_table.can_insert(num_inserts)
+
+  def __repr__(self):
+    return repr(self.internal_table)
 
 
 class Server:
@@ -285,6 +293,9 @@ class Server:
 
     if hasattr(self, '_port'):
       portpicker.return_port(self._port)
+
+  def __repr__(self):
+    return repr(self._server)
 
   @property
   def port(self):

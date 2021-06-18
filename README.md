@@ -79,7 +79,7 @@ server = reverb.Server(tables=[
 Create a client to communicate with the server:
 
 ```python
-client = reverb.Client(‘localhost:8000’)
+client = reverb.Client('localhost:8000')
 print(client.server_info())
 ```
 
@@ -93,13 +93,25 @@ client.insert([0, 1], priorities={'my_table': 1.0})
 An item can also reference multiple data elements:
 
 ```python
-# Creates three data elements ([2, 2] , [3, 3], and [4, 4]) and a single item
-# `[[2, 2], [3, 3], [4, 4]]` that references all three of them.
-with client.writer(max_sequence_length=3) as writer:
-  writer.append([2, 2])
-  writer.append([3, 3])
-  writer.append([4, 4])
-  writer.create_item('my_table', num_timesteps=3, priority=1.0)
+
+# Appends three data elements and inserts a single items which references all
+# of them as {'a': [2, 3, 4], 'b': [12, 13, 14]}.
+with client.trajectory_writer(num_keep_alive_refs=3) as writer:
+  writer.append({'a': 2, 'b': 12})
+  writer.append({'a': 3, 'b': 13})
+  writer.append({'a': 4, 'b': 14})
+
+  # Create an item referencing all the data. 
+  writer.create_item(
+      table='my_table',
+      priority=1.0,
+      trajectory={
+          'a': writer.history['a'][:],
+          'b': writer.history['b'][:],
+      })
+
+  # Block until the item has been inserted and confirmed by the server.
+  writer.flush()
 ```
 
 The items we have added to Reverb can be read by sampling them:
@@ -236,7 +248,7 @@ reverb.Table(
 )
 
 # Or use the helper classmethod `.queue`.
-reverb.Table.queue(name=’my_queue', max_size=1000)
+reverb.Table.queue(name='my_queue', max_size=1000)
 ```
 
 Examples of algorithms that make use of Queues are
@@ -319,16 +331,17 @@ for details on the implementation of checkpointing in Reverb.
 
 ## Citation
 
-If you use this code, please cite it as:
+If you use this code, please cite the
+[Reverb paper](https://arxiv.org/abs/2102.04736) as
 
 ```
-@software{Reverb,
-  title = {{Reverb}: An efficient data storage and transport system for ML research},
-  author = "{Albin Cassirer, Gabriel Barth-Maron, Thibault Sottiaux, Manuel Kroiss, Eugene Brevdo}",
-  howpublished = {\url{https://github.com/deepmind/reverb}},
-  url = "https://github.com/deepmind/reverb",
-  year = 2020,
-  note = "[Online; accessed 01-June-2020]"
+@misc{cassirer2021reverb,
+      title={Reverb: A Framework For Experience Replay},
+      author={Albin Cassirer, Gabriel Barth-Maron, Eugene Brevdo, Sabela Ramos, Toby Boyd, Thibault Sottiaux, Manuel Kroiss},
+      year={2021},
+      eprint={2102.04736},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG}
 }
 ```
 

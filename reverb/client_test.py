@@ -141,6 +141,7 @@ class ClientTest(absltest.TestCase):
   def test_writer_raises_if_max_in_flight_items_lt_1(self):
     self.client.writer(1, max_in_flight_items=1)
     self.client.writer(1, max_in_flight_items=2)
+    self.client.writer(1, max_in_flight_items=None)
 
     with self.assertRaises(ValueError):
       self.client.writer(1, max_in_flight_items=-1)
@@ -286,6 +287,13 @@ class ClientTest(absltest.TestCase):
     self.assertEqual(info.current_size, 1000)
     pool.close()
     pool.join()
+
+  def test_validates_trajectory_writer_config(self):
+    with self.assertRaises(ValueError):
+      self.client.trajectory_writer(0)
+
+    with self.assertRaises(ValueError):
+      self.client.trajectory_writer(-1)
 
 
 if __name__ == '__main__':

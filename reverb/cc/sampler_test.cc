@@ -28,9 +28,11 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "reverb/cc/platform/logging.h"
+#include "reverb/cc/platform/status_matchers.h"
 #include "reverb/cc/reverb_service.pb.h"
 #include "reverb/cc/reverb_service_mock.grpc.pb.h"
 #include "reverb/cc/selectors/fifo.h"
+#include "reverb/cc/support/tf_util.h"
 #include "reverb/cc/tensor_compression.h"
 #include "reverb/cc/testing/proto_test_util.h"
 #include "reverb/cc/testing/tensor_testutil.h"
@@ -38,8 +40,6 @@
 #include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/framework/tensor_util.h"
 #include "tensorflow/core/framework/types.pb.h"
-#include "tensorflow/core/lib/core/status_test_util.h"
-#include "tensorflow/core/protobuf/error_codes.pb.h"
 
 namespace deepmind {
 namespace reverb {
@@ -171,17 +171,26 @@ tensorflow::Tensor MakeConstantTensor(
 }
 
 SampleStreamResponse MakeResponse(int item_length, bool delta_encode = false,
-                                  int offset = 0, int data_length = 0) {
+                                  int offset = 0, int data_length = 0,
+                                  bool squeeze = false) {
+  REVERB_CHECK(!squeeze || item_length == 1);
+
   if (data_length == 0) {
     data_length = item_length;
   }
   REVERB_CHECK_LE(item_length + offset, data_length);
 
   SampleStreamResponse response;
-  response.mutable_info()->mutable_item()->mutable_sequence_range()->set_length(
-      item_length);
-  response.mutable_info()->mutable_item()->mutable_sequence_range()->set_offset(
-      offset);
+  auto* column = response.mutable_info()
+                     ->mutable_item()
+                     ->mutable_flat_trajectory()
+                     ->add_columns();
+  column->set_squeeze(squeeze);
+
+  auto* slice = column->add_chunk_slices();
+  slice->set_length(item_length);
+  slice->set_offset(offset);
+
   auto tensor = MakeTensor(data_length);
   if (delta_encode) {
     tensor = DeltaEncode(tensor, true);
@@ -190,6 +199,10 @@ SampleStreamResponse MakeResponse(int item_length, bool delta_encode = false,
 
   CompressTensorAsProto(tensor,
                         response.mutable_data()->mutable_data()->add_tensors());
+
+  response.mutable_data()->mutable_sequence_range()->set_start(0);
+  response.mutable_data()->mutable_sequence_range()->set_end(data_length);
+
   return response;
 }
 
@@ -225,15 +238,34 @@ TableItem MakeItem(uint64_t key, double priority,
   }
 
   item.item = testing::MakePrioritizedItem(key, priority, data);
-  item.item.mutable_sequence_range()->set_offset(offset);
-  item.item.mutable_sequence_range()->set_length(length);
+
+  int32_t remaining = length;
+  for (int slice_index = 0; slice_index < sequences.size(); slice_index++) {
+    for (int col_index = 0;
+         col_index < item.item.flat_trajectory().columns_size(); col_index++) {
+      auto* col =
+          item.item.mutable_flat_trajectory()->mutable_columns(col_index);
+      auto* slice = col->mutable_chunk_slices(slice_index);
+      slice->set_offset(offset);
+      slice->set_length(
+          std::min<int32_t>(slice->length() - slice->offset(), remaining));
+      slice->set_index(col_index);
+    }
+
+    remaining -= item.item.flat_trajectory()
+                     .columns(0)
+                     .chunk_slices(slice_index)
+                     .length();
+    offset = 0;
+  }
 
   return item;
 }
 
 void InsertItem(Table* table, uint64_t key, double priority,
                 std::vector<int> sequence_lengths, int32_t offset = 0,
-                int32_t length = 0) {
+                int32_t length = 0, bool squeeze = false) {
+  REVERB_CHECK(!squeeze || length == 1);
   if (length == 0) {
     length =
         std::accumulate(sequence_lengths.begin(), sequence_lengths.end(), 0) -
@@ -248,8 +280,29 @@ void InsertItem(Table* table, uint64_t key, double priority,
     step_index += sequence_lengths[i];
   }
 
-  TF_EXPECT_OK(
-      table->InsertOrAssign(MakeItem(key, priority, ranges, offset, length)));
+  auto item = MakeItem(key, priority, ranges, offset, length);
+  item.item.mutable_flat_trajectory()->mutable_columns(0)->set_squeeze(squeeze);
+  REVERB_EXPECT_OK(table->InsertOrAssign(std::move(item)));
+}
+
+TEST(SampleTest, IsComposedOfTimesteps) {
+  Sample timestep_sample(
+      /*key=*/100,
+      /*probability=*/0.5,
+      /*table_size=*/2,
+      /*priority=*/1,
+      /*column_chunks=*/{{MakeTensor(5)}, {MakeTensor(5)}},
+      /*squeeze_columns=*/{false});
+  EXPECT_TRUE(timestep_sample.is_composed_of_timesteps());
+
+  Sample non_timestep_sample(
+      /*key=*/100,
+      /*probability=*/0.5,
+      /*table_size=*/2,
+      /*priority=*/1,
+      /*column_chunks=*/{{MakeTensor(5)}, {MakeTensor(10)}},
+      /*squeeze_columns=*/{false});
+  EXPECT_FALSE(non_timestep_sample.is_composed_of_timesteps());
 }
 
 TEST(GrpcSamplerTest, SendsFirstRequest) {
@@ -257,7 +310,7 @@ TEST(GrpcSamplerTest, SendsFirstRequest) {
   Sampler sampler(stub, "table", {1, 1, 1});
   std::vector<tensorflow::Tensor> sample;
   bool end_of_sequence;
-  TF_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
+  REVERB_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
   EXPECT_THAT(stub->requests(), SizeIs(1));
 }
 
@@ -270,17 +323,17 @@ TEST(GrpcSamplerTest, SetsEndOfSequence) {
 
   // First sequence has 2 timesteps so first timestep should not be the end of
   // a sequence.
-  TF_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
+  REVERB_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
   absl::SleepFor(absl::Milliseconds(5));
   EXPECT_FALSE(end_of_sequence);
 
   // Second timestep is the end of the first sequence.
-  TF_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
+  REVERB_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
   absl::SleepFor(absl::Milliseconds(5));
   EXPECT_TRUE(end_of_sequence);
 
   // Third timestep is the first and only timestep of the second sequence.
-  TF_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
+  REVERB_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
   absl::SleepFor(absl::Milliseconds(5));
   EXPECT_TRUE(end_of_sequence);
 }
@@ -297,15 +350,15 @@ TEST(LocalSamplerTest, SetsEndOfSequence) {
 
   // First sequence has 2 timesteps so first timestep should not be the end of
   // a sequence.
-  TF_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
+  REVERB_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
   EXPECT_FALSE(end_of_sequence);
 
   // Second timestep is the end of the first sequence.
-  TF_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
+  REVERB_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
   EXPECT_TRUE(end_of_sequence);
 
   // Third timestep is the first and only timestep of the second sequence.
-  TF_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
+  REVERB_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
   EXPECT_TRUE(end_of_sequence);
 }
 
@@ -318,14 +371,14 @@ TEST(GrpcSamplerTest, GetNextSampleReturnsPriority) {
   Sampler sampler(stub, "table", {2, 1});
 
   std::vector<tensorflow::Tensor> first;
-  TF_EXPECT_OK(sampler.GetNextSample(&first));
+  REVERB_EXPECT_OK(sampler.GetNextSample(&first));
   EXPECT_THAT(first,
               SizeIs(5));  // ID, probability, table size, priority, data.
   ExpectTensorEqual<double>(
       first[3], MakeConstantTensor<tensorflow::DT_DOUBLE>({5}, 100.0));
 
   std::vector<tensorflow::Tensor> second;
-  TF_EXPECT_OK(sampler.GetNextSample(&second));
+  REVERB_EXPECT_OK(sampler.GetNextSample(&second));
   EXPECT_THAT(second,
               SizeIs(5));  // ID, probability, table size, priority, data.
   ExpectTensorEqual<double>(
@@ -342,14 +395,14 @@ TEST(LocalSamplerTest, GetNextSampleReturnsPriority) {
   Sampler sampler(table, options);
 
   std::vector<tensorflow::Tensor> first;
-  TF_EXPECT_OK(sampler.GetNextSample(&first));
+  REVERB_EXPECT_OK(sampler.GetNextSample(&first));
   EXPECT_THAT(first,
               SizeIs(5));  // ID, probability, table size, priority, data.
   ExpectTensorEqual<double>(
       first[3], MakeConstantTensor<tensorflow::DT_DOUBLE>({5}, 100.0));
 
   std::vector<tensorflow::Tensor> second;
-  TF_EXPECT_OK(sampler.GetNextSample(&second));
+  REVERB_EXPECT_OK(sampler.GetNextSample(&second));
   EXPECT_THAT(second,
               SizeIs(5));  // ID, probability, table size, priority, data.
   ExpectTensorEqual<double>(
@@ -361,13 +414,13 @@ TEST(GrpcSamplerTest, GetNextSampleReturnsWholeSequence) {
   Sampler sampler(stub, "table", {2, 1});
 
   std::vector<tensorflow::Tensor> first;
-  TF_EXPECT_OK(sampler.GetNextSample(&first));
+  REVERB_EXPECT_OK(sampler.GetNextSample(&first));
   EXPECT_THAT(first,
               SizeIs(5));  // ID, probability, table size, priority, data.
   ExpectTensorEqual<tensorflow::uint64>(first[4], MakeTensor(5));
 
   std::vector<tensorflow::Tensor> second;
-  TF_EXPECT_OK(sampler.GetNextSample(&second));
+  REVERB_EXPECT_OK(sampler.GetNextSample(&second));
   EXPECT_THAT(second,
               SizeIs(5));  // ID, probability, table size, priority, data.
   ExpectTensorEqual<tensorflow::uint64>(second[4], MakeTensor(3));
@@ -381,13 +434,13 @@ TEST(LocalSamplerTest, GetNextSampleReturnsWholeSequence) {
   Sampler sampler(table, {2});
 
   std::vector<tensorflow::Tensor> first;
-  TF_EXPECT_OK(sampler.GetNextSample(&first));
+  REVERB_EXPECT_OK(sampler.GetNextSample(&first));
   EXPECT_THAT(first,
               SizeIs(5));  // ID, probability, table size, priority, data.
   ExpectTensorEqual<tensorflow::uint64>(first[4], MakeTensor(5));
 
   std::vector<tensorflow::Tensor> second;
-  TF_EXPECT_OK(sampler.GetNextSample(&second));
+  REVERB_EXPECT_OK(sampler.GetNextSample(&second));
   EXPECT_THAT(second,
               SizeIs(5));  // ID, probability, table size, priority, data.
   ExpectTensorEqual<tensorflow::uint64>(second[4], MakeTensor(3));
@@ -402,7 +455,7 @@ TEST(GrpcSamplerTest, GetNextSampleTrimsSequence) {
   Sampler sampler(stub, "table", {3, 1});
 
   std::vector<tensorflow::Tensor> start_trimmed;
-  TF_EXPECT_OK(sampler.GetNextSample(&start_trimmed));
+  REVERB_EXPECT_OK(sampler.GetNextSample(&start_trimmed));
   ASSERT_THAT(start_trimmed,
               SizeIs(5));  // ID, probability, table size, priority, data.
   ExpectTensorEqual<tensorflow::uint64>(
@@ -410,14 +463,14 @@ TEST(GrpcSamplerTest, GetNextSampleTrimsSequence) {
       tensorflow::tensor::DeepCopy(MakeTensor(6).Slice(1, 6)));
 
   std::vector<tensorflow::Tensor> end_trimmed;
-  TF_EXPECT_OK(sampler.GetNextSample(&end_trimmed));
+  REVERB_EXPECT_OK(sampler.GetNextSample(&end_trimmed));
   ASSERT_THAT(end_trimmed,
               SizeIs(5));  // ID, probability, table size, priority, data.
   ExpectTensorEqual<tensorflow::uint64>(end_trimmed[4],
                                         MakeTensor(4).Slice(0, 3));
 
   std::vector<tensorflow::Tensor> start_and_end_trimmed;
-  TF_EXPECT_OK(sampler.GetNextSample(&start_and_end_trimmed));
+  REVERB_EXPECT_OK(sampler.GetNextSample(&start_and_end_trimmed));
   ASSERT_THAT(start_and_end_trimmed,
               SizeIs(5));  // ID, probability, table size, priority, data.
   ExpectTensorEqual<tensorflow::uint64>(
@@ -434,7 +487,7 @@ TEST(LocalSamplerTest, GetNextSampleTrimsSequence) {
   Sampler sampler(table, {3});
 
   std::vector<tensorflow::Tensor> start_trimmed;
-  TF_EXPECT_OK(sampler.GetNextSample(&start_trimmed));
+  REVERB_EXPECT_OK(sampler.GetNextSample(&start_trimmed));
   ASSERT_THAT(start_trimmed,
               SizeIs(5));  // ID, probability, table size, priority, data.
   ExpectTensorEqual<tensorflow::uint64>(
@@ -442,27 +495,121 @@ TEST(LocalSamplerTest, GetNextSampleTrimsSequence) {
       tensorflow::tensor::DeepCopy(MakeTensor(5).Slice(1, 5)));
 
   std::vector<tensorflow::Tensor> end_trimmed;
-  TF_EXPECT_OK(sampler.GetNextSample(&end_trimmed));
+  REVERB_EXPECT_OK(sampler.GetNextSample(&end_trimmed));
   ASSERT_THAT(end_trimmed,
               SizeIs(5));  // ID, probability, table size, priority, data.
   ExpectTensorEqual<tensorflow::uint64>(end_trimmed[4],
                                         MakeTensor(3).Slice(0, 2));
 
   std::vector<tensorflow::Tensor> start_and_end_trimmed;
-  TF_EXPECT_OK(sampler.GetNextSample(&start_and_end_trimmed));
+  REVERB_EXPECT_OK(sampler.GetNextSample(&start_and_end_trimmed));
   ASSERT_THAT(start_and_end_trimmed,
               SizeIs(5));  // ID, probability, table size, priority, data.
 
   tensorflow::Tensor start_and_end_trimmer_want;
-  TF_EXPECT_OK(tensorflow::tensor::Concat(
+  REVERB_EXPECT_OK(FromTensorflowStatus(tensorflow::tensor::Concat(
       {
           tensorflow::tensor::DeepCopy(MakeTensor(2).Slice(1, 2)),
           tensorflow::tensor::DeepCopy(MakeTensor(3).Slice(0, 1)),
       },
-      &start_and_end_trimmer_want));
+      &start_and_end_trimmer_want)));
 
   ExpectTensorEqual<tensorflow::uint64>(start_and_end_trimmed[4],
                                         start_and_end_trimmer_want);
+}
+
+TEST(GrpcSamplerTest, GetNextTrajectorySqueezesColumnsIfSet) {
+  auto stub = MakeGoodStub({
+      MakeResponse(
+          /*item_length=*/1,
+          /*delta_encode=*/false,
+          /*offset=*/1,
+          /*data_length=*/4,
+          /*squeeze=*/true),
+      MakeResponse(
+          /*item_length=*/1,
+          /*delta_encode=*/false,
+          /*offset=*/1,
+          /*data_length=*/4,
+          /*squeeze=*/false),
+  });
+  Sampler sampler(stub, "table", {3, 1});
+
+  std::vector<tensorflow::Tensor> squeezed;
+  REVERB_EXPECT_OK(sampler.GetNextTrajectory(&squeezed));
+  ASSERT_THAT(squeezed,
+              SizeIs(5));  // ID, probability, table size, priority, data.
+  ExpectTensorEqual<tensorflow::uint64>(
+      squeezed[4], tensorflow::tensor::DeepCopy(MakeTensor(4).SubSlice(1)));
+
+  std::vector<tensorflow::Tensor> not_squeezed;
+  REVERB_EXPECT_OK(sampler.GetNextTrajectory(&not_squeezed));
+  ASSERT_THAT(not_squeezed,
+              SizeIs(5));  // ID, probability, table size, priority, data.
+  ExpectTensorEqual<tensorflow::uint64>(
+      not_squeezed[4], tensorflow::tensor::DeepCopy(MakeTensor(4).Slice(1, 2)));
+}
+
+TEST(LocalSamplerTest, GetNextTrajectorySqueezesColumnsIfSet) {
+  auto table = MakeTable();
+  InsertItem(
+      /*table=*/table.get(),
+      /*key=*/1,
+      /*priority=*/1.0,
+      /*sequence_lengths=*/{5},
+      /*offset=*/2,
+      /*length=*/1,
+      /*squeeze=*/true);
+
+  InsertItem(
+      /*table=*/table.get(),
+      /*key=*/2,
+      /*priority=*/1.0,
+      /*sequence_lengths=*/{5},
+      /*offset=*/2,
+      /*length=*/1,
+      /*squeeze=*/false);
+
+  Sampler sampler(table, {2});
+
+  std::vector<tensorflow::Tensor> squeezed;
+  REVERB_EXPECT_OK(sampler.GetNextTrajectory(&squeezed));
+  ASSERT_THAT(squeezed,
+              SizeIs(5));  // ID, probability, table size, priority, data.
+  ExpectTensorEqual<tensorflow::uint64>(
+      squeezed[4], tensorflow::tensor::DeepCopy(MakeTensor(4).SubSlice(2)));
+
+  std::vector<tensorflow::Tensor> not_squeezed;
+  REVERB_EXPECT_OK(sampler.GetNextTrajectory(&not_squeezed));
+  ASSERT_THAT(not_squeezed,
+              SizeIs(5));  // ID, probability, table size, priority, data.
+  ExpectTensorEqual<tensorflow::uint64>(
+      not_squeezed[4], tensorflow::tensor::DeepCopy(MakeTensor(4).Slice(2, 3)));
+}
+
+TEST(LocalSamplerTest, RespectsMaxInFlightItems) {
+  auto table = MakeTable(100);
+  for (int i = 0; i < 100; i++) {
+    InsertItem(table.get(), i + 1, 1.0, {1});
+  }
+
+  Sampler::Options options;
+  options.max_samples = 100;
+  options.max_in_flight_samples_per_worker = 3;
+  options.flexible_batch_size = 5;
+  Sampler sampler(table, options);
+
+  for (int i = 0; i < options.max_samples; i++) {
+    int num_samples =
+        table->info().rate_limiter_info().sample_stats().completed();
+    int in_flight_items = num_samples - i;
+
+    EXPECT_LE(in_flight_items, options.max_in_flight_samples_per_worker + 1);
+    EXPECT_GE(in_flight_items, 0);
+
+    std::vector<tensorflow::Tensor> sample;
+    REVERB_ASSERT_OK(sampler.GetNextSample(&sample));
+  }
 }
 
 TEST(LocalSamplerTest, Close) {
@@ -473,15 +620,15 @@ TEST(LocalSamplerTest, Close) {
   Sampler sampler(table, {3});
 
   std::vector<tensorflow::Tensor> first;
-  TF_EXPECT_OK(sampler.GetNextSample(&first));
+  REVERB_EXPECT_OK(sampler.GetNextSample(&first));
 
   std::vector<tensorflow::Tensor> second;
-  TF_EXPECT_OK(sampler.GetNextSample(&second));
+  REVERB_EXPECT_OK(sampler.GetNextSample(&second));
 
   sampler.Close();
 
   std::vector<tensorflow::Tensor> third;
-  EXPECT_EQ(sampler.GetNextSample(&third).code(), tensorflow::error::CANCELLED);
+  EXPECT_EQ(sampler.GetNextSample(&third).code(), absl::StatusCode::kCancelled);
 }
 
 TEST(GrpcSamplerTest, RespectsBufferSizeAndMaxSamples) {
@@ -516,7 +663,7 @@ TEST(GrpcSamplerTest, RespectsBufferSizeAndMaxSamples) {
 
   // The first 9 (9 + 1 = 10) pops should not result in a new request.
   for (int i = 0; i < kMaxInFlightSamplesPerWorker - kNumWorkers - 1; i++) {
-    TF_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
+    REVERB_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
   }
 
   test::WaitFor([&]() { return stub->requests().size() == 1; },
@@ -525,7 +672,7 @@ TEST(GrpcSamplerTest, RespectsBufferSizeAndMaxSamples) {
 
   // The 10th sample (+1 in the queue) mean that all the requested samples
   // have been received and thus a new request is sent to retrieve more.
-  TF_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
+  REVERB_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
   test::WaitFor(
       [&]() {
         return stub->requests().size() == 2 &&
@@ -543,7 +690,7 @@ TEST(GrpcSamplerTest, RespectsBufferSizeAndMaxSamples) {
   // Consuming the remaining 10 samples should not trigger any more requests
   // as this would violate `max_samples`.
   for (int i = 0; i < 10; i++) {
-    TF_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
+    REVERB_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
   }
   test::WaitFor([&]() { return stub->requests().size() == 2; },
                 absl::Milliseconds(10), 100);
@@ -555,8 +702,8 @@ TEST(GrpcSamplerTest, UnpacksDeltaEncodedTensors) {
   Sampler sampler(stub, "table", {2, 1});
   std::vector<tensorflow::Tensor> not_encoded;
   std::vector<tensorflow::Tensor> encoded;
-  TF_EXPECT_OK(sampler.GetNextSample(&not_encoded));
-  TF_EXPECT_OK(sampler.GetNextSample(&encoded));
+  REVERB_EXPECT_OK(sampler.GetNextSample(&not_encoded));
+  REVERB_EXPECT_OK(sampler.GetNextSample(&encoded));
   ASSERT_EQ(not_encoded.size(), encoded.size());
   EXPECT_EQ(encoded[0].dtype(), tensorflow::DT_UINT64);
   for (int i = 4; i < encoded.size(); i++) {
@@ -576,13 +723,13 @@ TEST(GrpcSamplerTest, GetNextTimestepForwardsFatalServerError) {
   // It is possible that the sample returned by one of the workers is reached
   // before the failing worker has reported it's error so we need to pop at
   // least two samples to ensure that the we will see the error.
-  tensorflow::Status status;
+  absl::Status status;
   for (int i = 0; status.ok() && i < kItemLength + 1; i++) {
     std::vector<tensorflow::Tensor> sample;
     bool end_of_sequence;
     status = sampler.GetNextTimestep(&sample, &end_of_sequence);
   }
-  EXPECT_EQ(status.code(), tensorflow::error::NOT_FOUND);
+  EXPECT_EQ(status.code(), absl::StatusCode::kNotFound);
   sampler.Close();
 }
 
@@ -595,7 +742,7 @@ TEST(LocalSamplerTest, GetSampleForwardsFatalServerError) {
 
   std::vector<tensorflow::Tensor> sample;
   auto status = sampler.GetNextSample(&sample);
-  EXPECT_EQ(status.code(), tensorflow::error::DEADLINE_EXCEEDED);
+  EXPECT_EQ(status.code(), absl::StatusCode::kDeadlineExceeded);
   sampler.Close();
 }
 
@@ -611,12 +758,12 @@ TEST(GrpcSamplerTest, GetNextSampleForwardsFatalServerError) {
   // It is possible that the sample returned by one of the workers is reached
   // before the failing worker has reported it's error so we need to pop at
   // least two samples to ensure that the we will see the error.
-  tensorflow::Status status;
+  absl::Status status;
   for (int i = 0; status.ok() && i < 2; i++) {
     std::vector<tensorflow::Tensor> sample;
     status = sampler.GetNextSample(&sample);
   }
-  EXPECT_EQ(status.code(), tensorflow::error::NOT_FOUND);
+  EXPECT_EQ(status.code(), absl::StatusCode::kNotFound);
 }
 
 TEST(LocalSamplerTest, GetNextTimestepForwardsFatalServerError) {
@@ -629,7 +776,7 @@ TEST(LocalSamplerTest, GetNextTimestepForwardsFatalServerError) {
   std::vector<tensorflow::Tensor> sample;
   bool end_of_sequence;
   auto status = sampler.GetNextTimestep(&sample, &end_of_sequence);
-  EXPECT_EQ(status.code(), tensorflow::error::DEADLINE_EXCEEDED);
+  EXPECT_EQ(status.code(), absl::StatusCode::kDeadlineExceeded);
   sampler.Close();
 }
 
@@ -649,7 +796,7 @@ TEST(GrpcSamplerTest, GetNextTimestepRetriesTransientErrors) {
   for (int i = 0; i < kItemLength + 1; i++) {
     std::vector<tensorflow::Tensor> sample;
     bool end_of_sequence;
-    TF_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
+    REVERB_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
   }
 }
 
@@ -668,7 +815,7 @@ TEST(GrpcSamplerTest, GetNextSampleRetriesTransientErrors) {
   // least two samples to ensure that the we will see the error.
   for (int i = 0; i < 2; i++) {
     std::vector<tensorflow::Tensor> sample;
-    TF_EXPECT_OK(sampler.GetNextSample(&sample));
+    REVERB_EXPECT_OK(sampler.GetNextSample(&sample));
   }
 }
 
@@ -677,10 +824,10 @@ TEST(GrpcSamplerTest, GetNextTimestepReturnsErrorIfMaximumSamplesExceeded) {
   Sampler sampler(stub, "table", {2, 1, 1});
   std::vector<tensorflow::Tensor> sample;
   bool end_of_sequence;
-  TF_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
-  TF_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
+  REVERB_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
+  REVERB_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
   EXPECT_EQ(sampler.GetNextTimestep(&sample, &end_of_sequence).code(),
-            tensorflow::error::OUT_OF_RANGE);
+            absl::StatusCode::kOutOfRange);
 }
 
 TEST(LocalSamplerTest, GetNextTimestepReturnsErrorIfMaximumSamplesExceeded) {
@@ -693,20 +840,43 @@ TEST(LocalSamplerTest, GetNextTimestepReturnsErrorIfMaximumSamplesExceeded) {
 
   std::vector<tensorflow::Tensor> sample;
   bool end_of_sequence;
-  TF_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
-  TF_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
+  REVERB_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
+  REVERB_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
   EXPECT_EQ(sampler.GetNextTimestep(&sample, &end_of_sequence).code(),
-            tensorflow::error::OUT_OF_RANGE);
+            absl::StatusCode::kOutOfRange);
+}
+
+TEST(GrpcSamplerTest, GetNextTimestepReturnsErrorIfNotDecomposible) {
+  auto response = MakeResponse(5);
+
+  // Add a column of length 10 to the existing one of length 5.
+  CompressTensorAsProto(MakeTensor(10),
+                        response.mutable_data()->mutable_data()->add_tensors());
+  auto* slice = response.mutable_info()
+                    ->mutable_item()
+                    ->mutable_flat_trajectory()
+                    ->add_columns()
+                    ->add_chunk_slices();
+  *slice = response.info().item().flat_trajectory().columns(0).chunk_slices(0);
+  slice->set_index(1);
+  slice->set_length(10);
+
+  auto stub = MakeGoodStub({std::move(response)});
+  Sampler sampler(stub, "table", {2, 1, 1});
+  std::vector<tensorflow::Tensor> sample;
+  bool end_of_sequence;
+  auto status = sampler.GetNextTimestep(&sample, &end_of_sequence);
+  EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument) << status;
 }
 
 TEST(GrpcSamplerTest, GetNextSampleReturnsErrorIfMaximumSamplesExceeded) {
   auto stub = MakeGoodStub({MakeResponse(5), MakeResponse(5), MakeResponse(5)});
   Sampler sampler(stub, "table", {2, 1, 1});
   std::vector<tensorflow::Tensor> sample;
-  TF_EXPECT_OK(sampler.GetNextSample(&sample));
-  TF_EXPECT_OK(sampler.GetNextSample(&sample));
+  REVERB_EXPECT_OK(sampler.GetNextSample(&sample));
+  REVERB_EXPECT_OK(sampler.GetNextSample(&sample));
   EXPECT_EQ(sampler.GetNextSample(&sample).code(),
-            tensorflow::error::OUT_OF_RANGE);
+            absl::StatusCode::kOutOfRange);
 }
 
 TEST(LocalSamplerTest, GetNextSampleReturnsErrorIfMaximumSamplesExceeded) {
@@ -718,10 +888,10 @@ TEST(LocalSamplerTest, GetNextSampleReturnsErrorIfMaximumSamplesExceeded) {
   Sampler sampler(table, {2});
 
   std::vector<tensorflow::Tensor> sample;
-  TF_EXPECT_OK(sampler.GetNextSample(&sample));
-  TF_EXPECT_OK(sampler.GetNextSample(&sample));
+  REVERB_EXPECT_OK(sampler.GetNextSample(&sample));
+  REVERB_EXPECT_OK(sampler.GetNextSample(&sample));
   EXPECT_EQ(sampler.GetNextSample(&sample).code(),
-            tensorflow::error::OUT_OF_RANGE);
+            absl::StatusCode::kOutOfRange);
 }
 
 TEST(GrpcSamplerTest, StressTestWithoutErrors) {
@@ -748,14 +918,14 @@ TEST(GrpcSamplerTest, StressTestWithoutErrors) {
   for (int i = 0; i < kItemLength * kMaxSamples; i++) {
     std::vector<tensorflow::Tensor> sample;
     bool end_of_sequence;
-    TF_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
+    REVERB_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
   }
 
   // There should be no more samples left.
   std::vector<tensorflow::Tensor> sample;
   bool end_of_sequence;
   EXPECT_EQ(sampler.GetNextTimestep(&sample, &end_of_sequence).code(),
-            tensorflow::error::OUT_OF_RANGE);
+            absl::StatusCode::kOutOfRange);
 }
 
 TEST(LocalSamplerTest, StressTestWithoutErrors) {
@@ -776,14 +946,14 @@ TEST(LocalSamplerTest, StressTestWithoutErrors) {
   for (int i = 0; i < kItemLength * kMaxSamples; i++) {
     std::vector<tensorflow::Tensor> sample;
     bool end_of_sequence;
-    TF_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
+    REVERB_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
   }
 
   // There should be no more samples left.
   std::vector<tensorflow::Tensor> sample;
   bool end_of_sequence;
   EXPECT_EQ(sampler.GetNextTimestep(&sample, &end_of_sequence).code(),
-            tensorflow::error::OUT_OF_RANGE);
+            absl::StatusCode::kOutOfRange);
   sampler.Close();
 }
 
@@ -815,14 +985,14 @@ TEST(GrpcSamplerTest, StressTestWithTransientErrors) {
   for (int i = 0; i < kItemLength * kMaxSamples; i++) {
     std::vector<tensorflow::Tensor> sample;
     bool end_of_sequence;
-    TF_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
+    REVERB_EXPECT_OK(sampler.GetNextTimestep(&sample, &end_of_sequence));
   }
 
   // There should be no more samples left.
   std::vector<tensorflow::Tensor> sample;
   bool end_of_sequence;
   EXPECT_EQ(sampler.GetNextTimestep(&sample, &end_of_sequence).code(),
-            tensorflow::error::OUT_OF_RANGE);
+            absl::StatusCode::kOutOfRange);
 }
 
 TEST(SamplerDeathTest, DiesIfMaxInFlightSamplesPerWorkerIsNonPositive) {
@@ -863,63 +1033,63 @@ TEST(SamplerDeathTest, DiesIfNumWorkersIsInvalid) {
 
 TEST(SamplerOptionsTest, ValidateDefaultOptions) {
   Sampler::Options options;
-  TF_EXPECT_OK(options.Validate());
+  REVERB_EXPECT_OK(options.Validate());
 }
 
 TEST(SamplerOptionsTest, ValidateChecksMaxSamples) {
   Sampler::Options options;
   options.max_samples = 0;
-  EXPECT_EQ(options.Validate().code(), tensorflow::error::INVALID_ARGUMENT);
+  EXPECT_EQ(options.Validate().code(), absl::StatusCode::kInvalidArgument);
   options.max_samples = Sampler::kUnlimitedMaxSamples;
-  TF_EXPECT_OK(options.Validate());
+  REVERB_EXPECT_OK(options.Validate());
   options.max_samples = -2;
-  EXPECT_EQ(options.Validate().code(), tensorflow::error::INVALID_ARGUMENT);
+  EXPECT_EQ(options.Validate().code(), absl::StatusCode::kInvalidArgument);
 }
 
 TEST(SamplerOptionsTest, ValidateChecksMaxInFlightSamplesPerWorker) {
   Sampler::Options options;
   options.max_in_flight_samples_per_worker = 0;
-  EXPECT_EQ(options.Validate().code(), tensorflow::error::INVALID_ARGUMENT);
+  EXPECT_EQ(options.Validate().code(), absl::StatusCode::kInvalidArgument);
   options.max_in_flight_samples_per_worker = -2;
-  EXPECT_EQ(options.Validate().code(), tensorflow::error::INVALID_ARGUMENT);
+  EXPECT_EQ(options.Validate().code(), absl::StatusCode::kInvalidArgument);
 }
 
 TEST(SamplerOptionsTest, ValidateChecksNumWorkers) {
   Sampler::Options options;
   options.num_workers = 0;
-  EXPECT_EQ(options.Validate().code(), tensorflow::error::INVALID_ARGUMENT);
+  EXPECT_EQ(options.Validate().code(), absl::StatusCode::kInvalidArgument);
   options.num_workers = Sampler::kAutoSelectValue;
-  TF_EXPECT_OK(options.Validate());
+  REVERB_EXPECT_OK(options.Validate());
   options.num_workers = -2;
-  EXPECT_EQ(options.Validate().code(), tensorflow::error::INVALID_ARGUMENT);
+  EXPECT_EQ(options.Validate().code(), absl::StatusCode::kInvalidArgument);
 }
 
 TEST(SamplerOptionsTest, ValidateChecksMaxSamplesPerStream) {
   Sampler::Options options;
   options.max_samples_per_stream = 0;
-  EXPECT_EQ(options.Validate().code(), tensorflow::error::INVALID_ARGUMENT);
+  EXPECT_EQ(options.Validate().code(), absl::StatusCode::kInvalidArgument);
   options.max_samples_per_stream = Sampler::kAutoSelectValue;
-  TF_EXPECT_OK(options.Validate());
+  REVERB_EXPECT_OK(options.Validate());
   options.max_samples_per_stream = -2;
-  EXPECT_EQ(options.Validate().code(), tensorflow::error::INVALID_ARGUMENT);
+  EXPECT_EQ(options.Validate().code(), absl::StatusCode::kInvalidArgument);
 }
 
 TEST(SamplerOptionsTest, ValidateChecksRateLimiterTimeout) {
   Sampler::Options options;
   options.rate_limiter_timeout = -absl::Seconds(1);
-  EXPECT_EQ(options.Validate().code(), tensorflow::error::INVALID_ARGUMENT);
+  EXPECT_EQ(options.Validate().code(), absl::StatusCode::kInvalidArgument);
   options.rate_limiter_timeout = absl::ZeroDuration();
-  TF_EXPECT_OK(options.Validate());
+  REVERB_EXPECT_OK(options.Validate());
 }
 
 TEST(SamplerOptionsTest, ValidateChecksFlexibleBatchSize) {
   Sampler::Options options;
   options.flexible_batch_size = 0;
-  EXPECT_EQ(options.Validate().code(), tensorflow::error::INVALID_ARGUMENT);
+  EXPECT_EQ(options.Validate().code(), absl::StatusCode::kInvalidArgument);
   options.flexible_batch_size = Sampler::kAutoSelectValue;
-  TF_EXPECT_OK(options.Validate());
+  REVERB_EXPECT_OK(options.Validate());
   options.flexible_batch_size = -2;
-  EXPECT_EQ(options.Validate().code(), tensorflow::error::INVALID_ARGUMENT);
+  EXPECT_EQ(options.Validate().code(), absl::StatusCode::kInvalidArgument);
 }
 
 }  // namespace
